@@ -26,6 +26,23 @@ from naiveBayesClassifier import tokenizer
 from naiveBayesClassifier.trainer import Trainer
 from naiveBayesClassifier.classifier import Classifier
 
+# API server
+HAS_FALCON = False
+try:
+    from wsgiref import simple_server
+    import falcon
+    import json
+    from falcon_multipart.middleware import MultipartMiddleware
+    HAS_FALCON = True
+except :
+    print '[-] import error pip install falcon falcon_multipart'
+    
+# Special strings
+base64strings = {}
+reversedStrings = {}
+pestudioMarker = {}
+stringScores = {}
+
 try:
     from lxml import etree
 
@@ -106,6 +123,114 @@ def get_files(dir, notRecursive):
                 filePath = os.path.join(root, filename)
                 yield filePath
 
+
+def parse_sample_data(filePath, size, fileData, generateInfo=False, onlyRelevantExtensions=False):
+    # Prepare dictionary
+    string_stats = {}
+    opcode_stats = {}
+    file_info = {}
+    known_sha1sums = []
+    try:
+        print "[+] Processing %s ..." % filePath
+
+        # Get Extension
+        extension = os.path.splitext(filePath)[1].lower()
+        if not extension in RELEVANT_EXTENSIONS and onlyRelevantExtensions:
+            if args.debug:
+                print "[-] EXTENSION %s - Skipping file %s" % (extension, filePath)
+            return 
+
+        # Size Check
+        try:
+            if size > (args.fs * 1024 * 1024):
+                if args.debug:
+                    print "[-] File is to big - Skipping file %s (use -fs to adjust this behaviour)" % (filePath)
+                return
+        except Exception, e:
+            pass
+
+        # Extract strings from file
+        strings = extract_strings(fileData)
+
+        # Extract opcodes from file
+        opcodes = []
+        if use_opcodes:
+            print "[-] Extracting OpCodes: %s" % filePath
+            opcodes = extract_opcodes(fileData)
+
+        # Add sha256 value
+        if generateInfo:
+            sha256sum = sha256(fileData).hexdigest()
+            file_info[filePath] = {}
+            file_info[filePath]["hash"] = sha256sum
+            file_info[filePath]["imphash"], file_info[filePath]["exports"] = get_pe_info(fileData)
+
+        # Skip if hash already known - avoid duplicate files
+        if sha256sum in known_sha1sums:
+            # if args.debug:
+            print "[-] Skipping strings/opcodes from %s due to MD5 duplicate detection" % filePath
+            return
+        else:
+            known_sha1sums.append(sha256sum)
+
+        # Magic evaluation
+        if not args.nomagic:
+            file_info[filePath]["magic"] = fileData[:2]
+        else:
+            file_info[filePath]["magic"] = ""
+
+        # File Size
+        file_info[filePath]["size"] = size
+
+        # Add stats for basename (needed for inverse rule generation)
+        fileName = os.path.basename(filePath)
+        folderName = os.path.basename(os.path.dirname(filePath))
+        file_info[fileName]["count"] = 1
+        file_info[fileName]["folder_names"] = []
+        file_info[fileName]["hashes"] = [sha256sum]
+        if folderName not in file_info[fileName]["folder_names"]:
+            file_info[fileName]["folder_names"].append(folderName)
+
+        # Add strings to statistics
+        for string in strings:
+            # String is not already known
+            if string not in string_stats:
+                string_stats[string] = {}
+                string_stats[string]["count"] = 0
+                string_stats[string]["files"] = []
+                string_stats[string]["files_basename"] = {}
+            # String count
+            string_stats[string]["count"] += 1
+            # Add file information
+            if fileName not in string_stats[string]["files_basename"]:
+                string_stats[string]["files_basename"][fileName] = 0
+            string_stats[string]["files_basename"][fileName] += 1
+            string_stats[string]["files"].append(filePath)
+
+        # Add opcods to statistics
+        for opcode in opcodes:
+            # String is not already known
+            if opcode not in opcode_stats:
+                opcode_stats[opcode] = {}
+                opcode_stats[opcode]["count"] = 0
+                opcode_stats[opcode]["files"] = []
+                opcode_stats[opcode]["files_basename"] = {}
+            # opcode count
+            opcode_stats[opcode]["count"] += 1
+            # Add file information
+            if fileName not in opcode_stats[opcode]["files_basename"]:
+                opcode_stats[opcode]["files_basename"][fileName] = 0
+            opcode_stats[opcode]["files_basename"][fileName] += 1
+            opcode_stats[opcode]["files"].append(filePath)
+
+        if args.debug:
+            print "[+] Processed " + filePath + " Size: " + str(size) + " Strings: " + str(len(string_stats)) + \
+                  " OpCodes: " + str(len(opcode_stats)) + " ... "
+
+    except Exception, e:
+        traceback.print_exc()
+        print "[E] ERROR reading file: %s" % filePath
+    return string_stats, opcode_stats, file_info
 
 def parse_sample_dir(dir, notRecursive=False, generateInfo=False, onlyRelevantExtensions=False):
     # Prepare dictionary
@@ -973,6 +1098,13 @@ def generate_general_condition(file_info):
 
 
 def generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_stats):
+    # Init Special strings
+    base64strings = {}
+    reversedStrings = {}
+    pestudioMarker = {}
+    stringScores = {}
+    # rule strings
+    rules, inverse_rules, global_rule = '', '', ''
     # Write to file ---------------------------------------------------
     if args.o:
         try:
@@ -991,7 +1123,8 @@ def generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_s
         general_info += "   License: {0}\n".format(args.l)
     general_info += "*/\n\n"
 
-    fh.write(general_info)
+    if args.o:
+        fh.write(general_info)
 
     # GLOBAL RULES ----------------------------------------------------
     if args.globalrule:
@@ -1044,7 +1177,8 @@ def generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_s
             file_opcodes[filePath] = filter_opcode_set(opcode_set)
 
         # GENERATE SIMPLE RULES -------------------------------------------
-        fh.write("/* Rule Set ----------------------------------------------------------------- */\n\n")
+        if args.o:
+            fh.write("/* Rule Set ----------------------------------------------------------------- */\n\n")
 
         for filePath in file_strings:
 
@@ -1389,7 +1523,8 @@ def generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_s
                 file_opcodes[fileName] = {}
 
         # GENERATE INVERSE RULES -------------------------------------------
-        fh.write("/* Inverse Rules ------------------------------------------------------------- */\n\n")
+        if args.o:
+            fh.write("/* Inverse Rules ------------------------------------------------------------- */\n\n")
 
         for fileName in inverse_stats:
             try:
@@ -1468,7 +1603,7 @@ def generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_s
     if args.debug:
         print rules
 
-    return (rule_count, inverse_rule_count, super_rule_count)
+    return (rule_count, inverse_rule_count, super_rule_count, rules, inverse_rules, global_rule)
 
 
 def get_rule_strings(string_elements, opcode_elements):
@@ -1762,6 +1897,7 @@ if __name__ == '__main__':
 
     group_output = parser.add_argument_group('Rule Output')
     group_output.add_argument('-o', help='Output rule file', metavar='output_rule_file', default='yargen_rules.yar')
+    group_output.add_argument('-f', help=argparse.SUPPRESS, action='store_true', default=False)
     group_output.add_argument('-a', help='Author Name', metavar='author', default='YarGen Rule Generator')
     group_output.add_argument('-r', help='Reference', metavar='ref', default='not set')
     group_output.add_argument('-l', help='License', metavar='lic', default='')
@@ -1987,6 +2123,9 @@ if __name__ == '__main__':
         exports_num = 0
 
         # Initialize all databases
+        if not os.path.exists(get_abs_path("./dbs/")):
+            print "[-] database not found.  Please run 'yarGen.py --update' to retrieve the newest database set."
+            sys.exit(1)
         for file in os.listdir(get_abs_path("./dbs/")):
             if not file.endswith(".db"):
                 continue
@@ -2063,24 +2202,21 @@ if __name__ == '__main__':
         # Scan malware files
         print "[+] Processing malware files ..."
 
-        # Special strings
-        base64strings = {}
-        reversedStrings = {}
-        pestudioMarker = {}
-        stringScores = {}
-
         # Extract all information
         (sample_string_stats, sample_opcode_stats, file_info) = \
             parse_sample_dir(args.m, args.nr, generateInfo=True, onlyRelevantExtensions=args.oe)
-
+        
         # Evaluate Strings
         (file_strings, file_opcodes, combinations, super_rules, inverse_stats) = \
             sample_string_evaluation(sample_string_stats, sample_opcode_stats, file_info)
 
         # Create Rule Files
-        (rule_count, inverse_rule_count, super_rule_count) = \
+        (rule_count, inverse_rule_count, super_rule_count, rules, inverse_rules, global_rule) = \
             generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_stats)
 
+        print rules
+        print inverse_rules
+        print global_rule
         if args.inverse:
             print "[=] Generated %s INVERSE rules." % str(inverse_rule_count)
         else:
@@ -2088,3 +2224,50 @@ if __name__ == '__main__':
             if not args.nosuper:
                 print "[=] Generated %s SUPER rules." % str(super_rule_count)
             print "[=] All rules written to %s" % args.o
+
+    # api server
+    if args.f and HAS_FALCON:
+        args.m = '/tmp/yaraGen'
+        args.nosuper = True
+        # Initialize Bayes Trainer (we will use the goodware string database for this)
+        print "[+] Initializing Bayes Filter ..."
+        stringTrainer = initialize_bayes_filter()
+        class MultipartFileUpload(object):
+            def on_post(self, req, resp):
+                param_file = req.get_param('file')
+                data = param_file.file.read()
+                filename = param_file.filename
+                filesize = param_file.file.tell()
+                args.o = None
+                # Scan malware files
+                print "[+] Processing malware files ..."
+                # Extract all information
+                (sample_string_stats, sample_opcode_stats, file_info) = \
+                    parse_sample_data(filename, filesize, data, generateInfo=True, onlyRelevantExtensions=args.oe)
+
+                print "[+] Processing sample string evaluation ..."
+                # Evaluate Strings
+                (file_strings, file_opcodes, combinations, super_rules, inverse_stats) = \
+                    sample_string_evaluation(sample_string_stats, sample_opcode_stats, file_info)
+
+                print "[+] Processing create rule ..."
+                # Create Rule Files
+                (rule_count, inverse_rule_count, super_rule_count, rules, inverse_rules, global_rule) = \
+                    generate_rules(file_strings, file_opcodes, super_rules, file_info, inverse_stats)
+
+                if args.inverse:
+                    print "[=] Generated %s INVERSE rules." % str(inverse_rule_count)
+                else:
+                    print "[=] Generated %s SIMPLE rules." % str(rule_count)
+                if inverse_rules:
+                    rules = inverse_rules
+                print rules
+                print global_rule
+                resp.body = json.dumps({'rules':rules})
+
+        print "[+] start api server"
+        app = falcon.API(middleware=[MultipartMiddleware()])
+        app.add_route('/', MultipartFileUpload())
+        httpd = simple_server.make_server("127.0.0.1", 8000, app)
+        httpd.serve_forever()
+
